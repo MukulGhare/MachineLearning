@@ -1,0 +1,199 @@
+import torch, math
+from collections import Counter
+
+SAVE_GPT = 'trained_gpt.pt'
+TRAIN_FILE = "input_childSpeech_trainingSet.txt"
+TEST_FILE  = "input_childSpeech_testSet.txt"
+
+
+ckpt = torch.load(SAVE_GPT, map_location=device)
+stoi = ckpt['vocab']['stoi']
+itos = ckpt['vocab']['itos']
+meta = ckpt['meta']
+block_size = meta['block_size']
+vocab_size = meta['vocab_size']
+
+# 2) rebuild model and load weights (GPTLanguageModel must be defined)
+# model = GPTLanguageModel().to(device)
+# model.load_state_dict(ckpt['model_state_dict'])
+# model.eval()
+
+encode = lambda s: [stoi[c] for c in s]   
+decode = lambda l: ''.join([itos[i] for i in l])
+
+# # 3) read test text and check vocabulary match
+# test_text = open(TEST_FILE, 'r', encoding='utf-8').read()
+# unseen = sorted(set(c for c in test_text if c not in stoi))
+# if unseen:
+#     raise ValueError(
+#         f"Test set contains {len(unseen)} UNIQUE characters not seen in training. "
+#         f"Examples: {unseen[:30]}. \n"
+#         "This demonstrates a vocabulary/domain mismatch; either rebuild vocab or handle <unk>."
+#     )
+
+# encode test data
+test_data = torch.tensor(encode(test_text), dtype=torch.long)
+if len(test_data) < block_size + 1:
+    raise ValueError("Test text too short (need > block_size characters).")
+
+# 4) evaluate model on non-overlapping blocks
+@torch.no_grad()
+def eval_model(model, data_tensor, block_size, device):
+    losses = []
+    for i in range(0, len(data_tensor) - block_size - 1, block_size):
+        x = data_tensor[i:i+block_size].unsqueeze(0).to(device)
+        y = data_tensor[i+1:i+block_size+1].unsqueeze(0).to(device)
+        _, loss = model(x, y)
+        losses.append(loss.item())
+    if len(losses) == 0:
+        raise ValueError("No evaluation blocks created. Check test length vs block_size.")
+    avg_loss = sum(losses) / len(losses)
+    return avg_loss, math.exp(avg_loss), len(losses)
+
+model_loss, model_ppl, nblocks = eval_model(model, test_data, block_size, device)
+
+# 5) compute baseline from the training file
+train_text = open(TRAIN_FILE, 'r', encoding='utf-8').read()
+
+# # training text should match the vocabulary used to build stoi
+# missing_train_chars = sorted(set(c for c in train_text if c not in stoi))
+# if missing_train_chars:
+#     raise ValueError("Training file contains chars not present in saved vocab. Unexpected.")
+
+counts = Counter(train_text)
+total = sum(counts.values())
+eps = 1e-12
+
+def baseline_avg_loss(data_tensor, counts, total, block_size):
+    neglogs = []
+    for i in range(0, len(data_tensor) - block_size - 1, block_size):
+        y = data_tensor[i+1:i+block_size+1]   # targets
+        for tok in y.tolist():
+            ch = itos[tok]
+            p = counts.get(ch, 0) / total
+            neglogs.append(-math.log(p + eps))
+    if len(neglogs) == 0:
+        raise ValueError("No tokens to evaluate for baseline. Check test length vs block_size.")
+    avg = sum(neglogs) / len(neglogs)
+    return avg, math.exp(avg)
+
+uni_loss, uni_ppl = baseline_avg_loss(test_data, counts, total, block_size)
+
+print(f"Model loss = {model_loss:.4f}, ppl = {model_ppl:.2f}")
+print(f"Baseline loss = {uni_loss:.4f}, ppl = {uni_ppl:.2f}")
+
+
+
+
+output
+Model loss = 0.3456, ppl = 1.41
+Baseline loss = 3.1228, ppl = 22.71
+
+
+
+import torch, math
+from collections import Counter
+
+SAVE_GPT = "trained_gpt.pt"
+TRAIN_FILE = "input_childSpeech_trainingSet.txt"
+SHK_FILE = "input_shakespeare.txt"
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# ---------------- LOAD MODEL + VOCAB ----------------
+ckpt = torch.load(SAVE_GPT, map_location=device)
+stoi = ckpt["vocab"]["stoi"]
+itos = ckpt["vocab"]["itos"]
+block_size = ckpt["meta"]["block_size"]
+
+# add <unk> if missing
+if "<unk>" not in stoi:
+    unk_id = len(stoi)
+    stoi["<unk>"] = unk_id
+    itos[unk_id] = "<unk>"
+else:
+    unk_id = stoi["<unk>"]
+
+# Load model
+model = GPTLanguageModel().to(device)
+model.load_state_dict(ckpt["model_state_dict"])
+model.eval()
+
+# Get embedding/table size (guaranteed integer)
+embed_size = model.token_embedding_table.num_embeddings
+print("DEBUG: model.embedding.num_embeddings =", embed_size, "  ckpt vocab len =", len(itos), "  unk_id =", unk_id)
+
+# Choose a truly-safe fallback index that is < embed_size
+safe_unk = unk_id if 0 <= unk_id < embed_size else 0
+if safe_unk != unk_id:
+    print(f"WARNING: checkpoint unk_id {unk_id} is out of model embedding range; using safe_unk={safe_unk} instead.")
+
+# ---------------- SAFE ENCODING ----------------
+def encode_safe(s):
+    encoded = []
+    oors = 0
+    for ch in s:
+        idx = stoi.get(ch, unk_id)
+        if not (0 <= idx < embed_size):# map unknown chars to checkpoint unk_id
+            idx = safe_unk
+            oors += 1
+        encoded.append(idx)
+    return encoded, oors
+
+# ---------------- LOAD SHAKESPEARE ----------------
+text = open(SHK_FILE, "r", encoding="utf-8").read()
+enc, n_oors = encode_safe(text)
+print(f"DEBUG: encoded {len(enc)} chars, remapped {n_oors} out-of-range tokens to safe_unk={safe_unk}")
+print("DEBUG: token id range after mapping ->", (min(enc) if enc else None, max(enc) if enc else None))
+
+data = torch.tensor(enc, dtype=torch.long)
+
+# ---------------- EVALUATION ----------------
+@torch.no_grad()
+def eval_model(model, data, block_size):
+    losses = []
+    n_blocks = 0
+    for i in range(0, len(data) - block_size - 1, block_size):
+        x = data[i:i+block_size].unsqueeze(0).to(device)
+        y = data[i+1:i+block_size+1].unsqueeze(0).to(device)
+        out, loss = model(x, y)   # model should now never see OOR indices
+        losses.append(loss.item())
+        n_blocks += 1
+    if n_blocks == 0:
+        raise ValueError(f"Not enough data to form a single block. Need block_size={block_size}, got data length={len(data)}")
+    avg = sum(losses)/len(losses)
+    return avg, math.exp(avg), n_blocks
+
+# ---------------- BASELINE ----------------
+train_text = open(TRAIN_FILE,"r",encoding="utf-8").read()
+counts = Counter(train_text)
+total = sum(counts.values())
+
+def baseline_loss(data, counts, total):
+    neglogs = []
+    for tok in data.tolist():
+        ch = itos.get(tok, "<unk>")
+        p = counts.get(ch, 0) / total
+        neglogs.append(-math.log(p + 1e-12))
+    avg = sum(neglogs) / len(neglogs)
+    return avg, math.exp(avg)
+
+# ---------------- RUN ----------------
+model_loss, model_ppl, blocks = eval_model(model, data, block_size)
+base_loss, base_ppl = baseline_loss(data, counts, total)
+
+print("\nShakespeare characters:", len(text))
+print("REMAPPED (OOR -> safe_unk):", n_oors)
+print(f"Model loss = {model_loss:.4f}, ppl = {model_ppl:.2f}, blocks = {blocks}")
+print(f"Unigram baseline loss = {base_loss:.4f}, ppl = {base_ppl:.2f}")
+
+
+DEBUG: model.embedding.num_embeddings = 40   ckpt vocab len = 41   unk_id = 40
+WARNING: checkpoint unk_id 40 is out of model embedding range; using safe_unk=0 instead.
+DEBUG: encoded 1115394 chars, remapped 81136 out-of-range tokens to safe_unk=0
+DEBUG: token id range after mapping -> (0, 39)
+
+Shakespeare characters: 1115394
+REMAPPED (OOR -> safe_unk): 81136
+Model loss = 6.7367, ppl = 842.76, blocks = 4357
+Unigram baseline loss = 3.1675, ppl = 23.75
